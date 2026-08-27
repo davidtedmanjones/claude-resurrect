@@ -1,0 +1,533 @@
+#!/usr/bin/env python3
+"""resurrect — browse, revive and manage Claude Code sessions across projects.
+
+Claude Code persists every conversation to <config>/projects/<dir>/<id>.jsonl;
+this tool makes that useful:
+
+  resurrect                 YOUR list: every session ever collected while
+                            running, sorted by last use. The default view.
+  resurrect collect         gather the currently-running sessions into the
+                            list (also happens silently on every launch)
+  resurrect all [--days N]  discovery view: every transcript on disk
+                            (resume one and it joins the list)
+  resurrect print           emit `cd … && claude --resume …` for the list
+
+In the table: type to filter · Enter resumes the session in its own directory
+· ctrl-n starts a new named session in the directory you launched from
+· ctrl-u unloads a row (hides it — transcripts are never touched)
+· tab shows unloaded rows so ctrl-u can bring them back.
+
+Claude launch command, first match wins:
+  $RESURRECT_CLAUDE_CMD  ·  "claude_cmd" in <config>/resurrect.json  ·  claude
+Add -y to any invocation for --dangerously-skip-permissions.
+No tmux, no daemon, no dependencies beyond python3 + the claude CLI.
+"""
+import sys
+
+if sys.platform == "win32":
+    sys.exit("resurrect requires macOS or Linux (curses + ps)")
+
+import curses
+import datetime
+import glob
+import json
+import locale
+import os
+import re
+import shlex
+import subprocess
+import time
+import uuid
+
+BASE = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+PROJECTS = os.path.join(BASE, "projects")
+SNAPFILE = os.path.join(BASE, "resurrect-snapshot.json")
+HIDEFILE = os.path.join(BASE, "resurrect-hidden.json")
+NAMEFILE = os.path.join(BASE, "resurrect-names.json")
+CONFFILE = os.path.join(BASE, "resurrect.json")
+MIN_SIZE = 2048   # discovery view skips aborted/empty sessions
+
+SID_RE = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z")
+CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")   # strip terminal-control chars
+
+try:
+    locale.setlocale(locale.LC_ALL, "")
+except locale.Error:
+    pass
+UTF = "utf" in (locale.getpreferredencoding(False) or "").lower()
+# marks are 2 terminal cells wide in either charset, so columns stay aligned
+M_LIVE, M_HIDDEN, M_NONE = ("⚡", "🗄", "  ") if UTF else ("* ", "# ", "  ")
+
+DESC_LOADED = [
+    "Your loaded sessions. Any Claude session seen running is collected in here automatically (opening",
+    "this table collects too). The list lives on disk and survives restarts — once loaded, a session stays",
+    "until you unload it (ctrl-u), which only hides the row. Conversations themselves are never lost.",
+]
+DESC_ALL = [
+    "Everything Claude has ever saved on disk, across all directories — conversations are never lost.",
+    "Enter re-opens one exactly where it left off; once it's running, it joins your loaded list.",
+    "Unloading (ctrl-u) only hides a row here — transcripts on disk are never touched.",
+]
+KEYBAR = (" enter resume · type to filter · ctrl-n new session here · "
+          "ctrl-u unload/reload · tab show unloaded · esc quit ")
+LEGEND = (" %s running now (enter refused — attach to the live one) · %s unloaded "
+          % (M_LIVE.strip(), M_HIDDEN.strip()))
+
+
+def clean(s):
+    return CTRL_RE.sub("·" if UTF else ".", s or "")
+
+
+def load_json(path, default):
+    """Missing file -> default. Corrupt file -> back it up, warn, default —
+    silently returning {} would let the next save orphan the old contents."""
+    try:
+        f = open(path)
+    except OSError:
+        return default
+    try:
+        with f:
+            obj = json.load(f)
+    except Exception:
+        bak = "%s.corrupt-%d" % (path, int(time.time()))
+        try:
+            os.replace(path, bak)
+            sys.stderr.write("resurrect: %s was corrupt — moved to %s\n"
+                             % (path, bak))
+        except OSError:
+            pass
+        return default
+    return obj if isinstance(obj, type(default)) else default
+
+
+def save_json(path, obj):
+    """Atomic replace so a crash mid-write can't destroy the store."""
+    tmp = path + ".tmp"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(obj, f, indent=1)
+        os.replace(tmp, path)
+    except OSError as e:
+        sys.stderr.write("resurrect: could not write %s (%s)\n" % (path, e))
+
+
+def claude_cmd(yolo):
+    raw = (os.environ.get("RESURRECT_CLAUDE_CMD")
+           or load_json(CONFFILE, {}).get("claude_cmd")
+           or "claude")
+    cmd = shlex.split(raw) or ["claude"]
+    if yolo and "--dangerously-skip-permissions" not in cmd:
+        cmd.append("--dangerously-skip-permissions")
+    return cmd
+
+
+def ps_lines():
+    """Own processes only — a shared machine's other users must not feed the
+    live map or the fresh count."""
+    try:
+        out = subprocess.run(["ps", "-xo", "pid,command"], capture_output=True,
+                             text=True).stdout
+    except OSError:
+        return []
+    return [l for l in out.splitlines() if l.strip()]
+
+
+LIVE_RE = re.compile(
+    r"(?:--resume|--session-id|-r)[= ]"
+    r"([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})(?=\s|$)")
+
+
+def live_sessions():
+    """sid -> pid for running claude processes whose argv names a session."""
+    live = {}
+    for ln in ps_lines():
+        if "claude" not in ln:
+            continue
+        m = LIVE_RE.search(ln)
+        if m:
+            try:
+                live[m.group(1)] = int(ln.split(None, 1)[0])
+            except (ValueError, IndexError):
+                pass
+    return live
+
+
+def transcript_paths(sid):
+    return glob.glob(os.path.join(PROJECTS, "*", glob.escape(sid) + ".jsonl"))
+
+
+def scan(days=None, only_sids=None, min_size=MIN_SIZE):
+    """Transcripts -> rows sorted newest first. only_sids: resolve exactly
+    those sessions (the loaded list); else glob everything within N days."""
+    now = time.time()
+    aliases = load_json(NAMEFILE, {})
+    if only_sids is not None:
+        paths = []
+        for sid in only_sids:
+            g = transcript_paths(sid)
+            if g:   # same sid can exist under several project dirs; newest wins
+                paths.append(max(g, key=lambda p: os.path.getmtime(p)))
+    else:
+        paths = glob.glob(os.path.join(PROJECTS, "*", "*.jsonl"))
+    rows = []
+    for tp in paths:
+        sid = os.path.basename(tp)[:-6]
+        if not SID_RE.match(sid):   # sids reach shell-pasteable output; be strict
+            continue
+        try:
+            st = os.stat(tp)
+        except OSError:
+            continue
+        if only_sids is None and (
+                (days and (now - st.st_mtime) / 86400 > days)
+                or st.st_size < min_size):
+            continue
+        title = cwd = None
+        try:
+            with open(tp, "rb") as f:
+                f.seek(0, 2)
+                sz = f.tell()
+                f.seek(max(0, sz - 131072))
+                tail = f.read().decode("utf-8", "ignore").splitlines()
+            head = open(tp, errors="ignore").readline(1000000)
+            for line in [head] + tail:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                cwd = d.get("cwd") or cwd
+                if d.get("type") == "ai-title" and d.get("aiTitle"):
+                    title = d["aiTitle"]
+            if not title:
+                for line in tail:
+                    try:
+                        d = json.loads(line)
+                    except Exception:
+                        continue
+                    if d.get("type") == "user":
+                        c = d.get("message", {}).get("content")
+                        if isinstance(c, str) and c.strip() and not c.startswith("<"):
+                            title = " ".join(c.split())[:60]
+        except Exception:
+            pass
+        if not cwd or not isinstance(cwd, str) or "\n" in cwd:
+            continue
+        name = aliases.get(sid) if isinstance(aliases, dict) else None
+        rows.append({"sid": sid, "cwd": clean(cwd),
+                     "title": clean(name or title or sid[:8]),
+                     "mtime": st.st_mtime})
+    rows.sort(key=lambda r: r["mtime"], reverse=True)
+    return rows
+
+
+COLS = "   %4s  %-12s  %-38s  %-52s  %s" % ("AGE", "LAST USED", "DIRECTORY",
+                                            "NAME", "ID")
+
+
+def fmt_row(r, live, hidden):
+    home = os.path.expanduser("~")
+    age = time.time() - r["mtime"]
+    rel = ("%dm" % (age // 60) if age < 3600 else
+           "%dh" % (age // 3600) if age < 86400 else
+           "%dd" % (age // 86400))
+    stamp = datetime.datetime.fromtimestamp(r["mtime"]).strftime("%d %b %H:%M")
+    mark = (M_LIVE if r["sid"] in live
+            else M_HIDDEN if r["sid"] in hidden else M_NONE)
+    return "%s %4s  %-12s  %-38.38s  %-52.52s  %s" % (
+        mark, rel, stamp, r["cwd"].replace(home, "~"), r["title"], r["sid"][:8])
+
+
+def prompt_line(stdscr, w, label):
+    """Minimal inline text prompt on the top row. Enter=accept, Esc=cancel."""
+    curses.curs_set(1)
+    buf = ""
+    while True:
+        try:
+            stdscr.addnstr(0, 0, (" %s%s" % (label, buf)).ljust(w - 1), w - 1,
+                           curses.A_BOLD | curses.A_REVERSE)
+        except curses.error:
+            pass
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch == 27:
+            curses.curs_set(0)
+            return None
+        if ch in (curses.KEY_ENTER, 10, 13):
+            curses.curs_set(0)
+            return buf.strip()
+        if ch in (curses.KEY_BACKSPACE, 127, 8):
+            buf = buf[:-1]
+        elif 32 <= ch < 127:
+            buf += chr(ch)
+
+
+def picker(rows, live, header, desc):
+    """Full-chrome table. Returns ('resume', row) | ('new', name) | None."""
+    os.environ.setdefault("ESCDELAY", "50")
+    hidden = set(h for h in load_json(HIDEFILE, []) if isinstance(h, str))
+
+    def run(stdscr):
+        nonlocal hidden
+        curses.curs_set(0)
+        try:
+            curses.use_default_colors()
+        except Exception:
+            pass
+        query, pos, top, show_hidden = "", 0, 0, False
+        while True:
+            q = query.lower()
+            view = []
+            for i, r in enumerate(rows):
+                if r["sid"] in hidden and not show_hidden:
+                    continue
+                if q and q not in fmt_row(r, live, hidden).lower():
+                    continue
+                view.append(i)
+            if pos >= len(view):
+                pos = max(len(view) - 1, 0)
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            if h < 8 or w < 40:
+                try:
+                    stdscr.addnstr(0, 0, "terminal too small (esc quits)",
+                                   max(w - 1, 1))
+                except curses.error:
+                    pass
+                stdscr.refresh()
+                if stdscr.getch() == 27:
+                    return None
+                continue   # anything else (incl. resize) just re-renders
+            title = " resurrect — %s · %d session%s%s%s" % (
+                header, len(view), "s"[:len(view) != 1],
+                "  ·  filter: " + query if query else "",
+                "  ·  showing unloaded" if show_hidden else "")
+            chrome = [(0, title, curses.A_BOLD | curses.A_REVERSE)]
+            chrome += [(1 + i, " " + d, curses.A_DIM) for i, d in enumerate(desc)]
+            chrome += [(1 + len(desc), COLS, curses.A_BOLD),
+                       (h - 2, KEYBAR, curses.A_REVERSE),
+                       (h - 1, LEGEND, curses.A_DIM)]
+            for y, txt, attr in chrome:
+                try:
+                    stdscr.addnstr(y, 0, txt.ljust(w - 1), w - 1, attr)
+                except (curses.error, UnicodeEncodeError):
+                    pass
+            body_top = 2 + len(desc)
+            avail = max(1, h - body_top - 2)
+            if pos < top:
+                top = pos
+            if pos >= top + avail:
+                top = pos - avail + 1
+            for i in range(avail):
+                vi = top + i
+                if vi >= len(view):
+                    break
+                r = rows[view[vi]]
+                attr = curses.A_REVERSE if vi == pos else (
+                    curses.A_DIM if r["sid"] in hidden else curses.A_NORMAL)
+                try:
+                    stdscr.addnstr(body_top + i, 0,
+                                   fmt_row(r, live, hidden).ljust(w - 1),
+                                   w - 1, attr)
+                except (curses.error, UnicodeEncodeError):
+                    pass
+            stdscr.refresh()
+            ch = stdscr.getch()
+            if ch == 27:
+                return None
+            elif ch == curses.KEY_DOWN:
+                pos = min(pos + 1, max(len(view) - 1, 0))
+            elif ch == curses.KEY_UP:
+                pos = max(pos - 1, 0)
+            elif ch == 9:                       # tab: show/hide unloaded rows
+                show_hidden = not show_hidden
+            elif ch == 21:                      # ctrl-u: unload <-> reload
+                if view:
+                    sid = rows[view[pos]]["sid"]
+                    hidden ^= {sid}
+                    save_json(HIDEFILE, sorted(hidden))
+            elif ch == 14:                      # ctrl-n: new named session here
+                name = prompt_line(stdscr, w, "new session name: ")
+                if name is not None:
+                    return ("new", name)
+            elif ch in (curses.KEY_ENTER, 10, 13):
+                if view:
+                    return ("resume", rows[view[pos]])
+            elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                query = query[:-1]
+            elif 32 <= ch < 127:
+                query += chr(ch)
+
+    try:
+        return curses.wrapper(run)
+    except curses.error as e:
+        sys.exit("resurrect: cannot start the UI (%s) — is TERM set?" % e)
+
+
+def launch(cmd):
+    print("+ " + shlex.join(cmd))   # receipt survives in scrollback
+    try:
+        os.execvp(cmd[0], cmd)
+    except OSError:
+        sys.exit("resurrect: cannot launch %r — is claude on your PATH?"
+                 % " ".join(cmd))
+
+
+def resume(row, yolo):
+    sid = row["sid"]
+    live = live_sessions()   # re-check at the moment of truth, not table-open time
+    if sid in live:
+        sys.exit("session %s is already running (pid %d) — attach to that "
+                 "instead of resuming a second copy" % (sid[:8], live[sid]))
+    if not os.path.isdir(row["cwd"]):
+        sys.exit("directory gone: %s" % row["cwd"])
+    os.chdir(row["cwd"])
+    launch(claude_cmd(yolo) + ["--resume", sid])
+
+
+def new_session(name, yolo):
+    sid = str(uuid.uuid4())
+    if name:
+        aliases = load_json(NAMEFILE, {})
+        aliases[sid] = name
+        save_json(NAMEFILE, aliases)
+    launch(claude_cmd(yolo) + ["--session-id", sid])
+
+
+def load_snap():
+    """Snapshot store: {sid: entry}. Migrates the old list format; drops
+    malformed or non-uuid keys (they could smuggle shell text into print)."""
+    snap = load_json(SNAPFILE, {})
+    s = snap.get("sessions")
+    if isinstance(s, list):   # v1 format
+        s = {e["sid"]: e for e in s if isinstance(e, dict) and "sid" in e}
+    if not isinstance(s, dict):
+        s = {}
+    snap["sessions"] = {k: v for k, v in s.items()
+                        if isinstance(k, str) and SID_RE.match(k)
+                        and isinstance(v, dict)}
+    return snap
+
+
+FRESH_SKIP = re.compile(r"--print|(?:^|\s)-p(?:\s|$)|\bclaude\s+mcp\b")
+
+
+def collect(quiet=False):
+    """Upsert the currently-running set into the store (the loaded list).
+    Entries are only ever added or refreshed (last_seen), never removed —
+    a post-reboot run can't clobber the pre-reboot record."""
+    live = live_sessions()
+    fresh = 0
+    for l in ps_lines():
+        parts = l.split(None, 1)
+        cmdline = parts[1] if len(parts) > 1 else ""
+        if (re.search(r"(^|/)claude( |$)", cmdline)
+                and "--resume" not in cmdline and "--session-id" not in cmdline
+                and not FRESH_SKIP.search(cmdline)):
+            fresh += 1
+    now = datetime.datetime.now().isoformat()
+    current = []
+    by_sid = {r["sid"]: r for r in scan(days=30)}
+    for sid in live:
+        r = by_sid.get(sid)
+        current.append({"sid": sid, "cwd": r["cwd"] if r else "",
+                        "title": r["title"] if r else "", "how": "argv"})
+    if fresh:
+        # sid-less fresh sessions: take the N most recently written transcripts
+        # not already claimed. No size floor — a just-started session's
+        # transcript is tiny, and skipping it would claim an older one instead.
+        claimed = {s["sid"] for s in current}
+        for r in scan(days=2, min_size=0):
+            if len([s for s in current if s["how"] == "recency"]) >= fresh:
+                break
+            if r["sid"] not in claimed:
+                current.append({"sid": r["sid"], "cwd": r["cwd"],
+                                "title": r["title"], "how": "recency"})
+    snap = load_snap()
+    for s in current:
+        e = snap["sessions"].setdefault(s["sid"], {"first_seen": now})
+        e.update({k: v for k, v in s.items() if k != "sid"})
+        e["last_seen"] = now
+    snap["updated_at"] = now
+    save_json(SNAPFILE, snap)
+    if not quiet:
+        print("collected: %d running now (%d exact, %d by recency) · "
+              "%d session(s) in the list — entries update, never drop"
+              % (len(current),
+                 len([s for s in current if s["how"] == "argv"]),
+                 len([s for s in current if s["how"] == "recency"]),
+                 len(snap["sessions"])))
+
+
+def main():
+    args = list(sys.argv[1:])
+    yolo = "-y" in args
+    args = [a for a in args if a != "-y"]
+    mode = args[0] if args and not args[0].startswith("-") else "browse"
+    days = 30
+    if "--days" in args:
+        try:
+            days = float(args[args.index("--days") + 1])
+            if days <= 0:
+                raise ValueError
+        except (IndexError, ValueError):
+            sys.exit("--days needs a positive number, e.g. --days 90")
+        if mode != "all":
+            sys.stderr.write("note: --days only affects 'resurrect all'\n")
+
+    if mode in ("collect", "sync", "snapshot"):
+        return collect()
+
+    if mode == "print":
+        snap = load_snap()
+        if not snap["sessions"]:
+            sys.exit("nothing collected yet — open a claude session and rerun")
+        rows = scan(only_sids=set(snap["sessions"]))
+        live = live_sessions()
+        hidden = set(h for h in load_json(HIDEFILE, []) if isinstance(h, str))
+        for r in rows:
+            if r["sid"] in hidden:
+                continue
+            flag = "  # already running" if r["sid"] in live else ""
+            print("cd %s && %s --resume %s%s" % (
+                shlex.quote(r["cwd"]), shlex.join(claude_cmd(yolo)),
+                r["sid"], flag))
+        return
+
+    if mode == "all":
+        rows = scan(days=days)
+        header = "everything on disk, last %g days" % days
+        desc = DESC_ALL
+    elif mode == "browse":
+        try:
+            collect(quiet=True)   # rolling upsert: new/live sessions join the list
+        except Exception:
+            pass
+        snap = load_snap()
+        if not snap["sessions"]:
+            sys.exit("nothing collected yet — open a claude session and rerun,"
+                     " or try 'resurrect all' to browse everything on disk")
+        rows = scan(only_sids=set(snap["sessions"]))
+        header = "loaded sessions"
+        desc = DESC_LOADED
+    else:
+        sys.exit(__doc__.strip())
+
+    if not rows:
+        sys.exit("nothing found")
+    if not sys.stdout.isatty():
+        live = live_sessions()
+        hidden = set(h for h in load_json(HIDEFILE, []) if isinstance(h, str))
+        for r in rows:
+            if r["sid"] not in hidden:
+                print(fmt_row(r, live, hidden))
+        return
+    sel = picker(rows, live_sessions(), header, desc)
+    if sel and sel[0] == "resume":
+        resume(sel[1], yolo)
+    elif sel and sel[0] == "new":
+        new_session(sel[1], yolo)
+
+
+if __name__ == "__main__":
+    main()
