@@ -360,6 +360,8 @@ def picker(rows, live, header, desc):
 
     try:
         return curses.wrapper(run)
+    except KeyboardInterrupt:
+        return None   # ctrl-c behaves like esc; wrapper has restored the terminal
     except curses.error as e:
         sys.exit("resurrect: cannot start the UI (%s) — is TERM set?" % e)
 
@@ -530,4 +532,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)   # quiet exit for ctrl-c outside the picker too
