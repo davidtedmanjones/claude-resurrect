@@ -68,7 +68,8 @@ Keys inside the table:
 | `Ctrl-N` | start a **new** session in the directory you ran `resurrect` from — prompts for a name that then appears in the NAME column |
 | `Ctrl-U` | **unload** the selected row (hide it from the table) — or reload it if it's already unloaded |
 | `Tab` | show/hide unloaded rows (they render dimmed with 🗄) |
-| `Esc` | quit |
+| `Ctrl-Y` | toggle "yolo" — launch claude with `--dangerously-skip-permissions` by default (persists to the config file; the title bar shows `⚡yolo` while active) |
+| `Esc` / `Ctrl-C` | quit |
 
 **Unload never deletes anything.** It adds the session id to a hide-list (`~/.claude/resurrect-hidden.json`); the transcript stays on disk and the row comes back with `Tab` → `Ctrl-U` any time. That's the only way a session leaves your view — nothing ages out.
 

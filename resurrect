@@ -69,7 +69,8 @@ DESC_ALL = [
     "Unloading (ctrl-u) only hides a row here — transcripts on disk are never touched.",
 ]
 KEYBAR = (" enter resume · type to filter · ctrl-n new session here · "
-          "ctrl-u unload/reload · tab show unloaded · esc quit ")
+          "ctrl-u unload/reload · tab show unloaded · ctrl-y yolo · esc quit ")
+YOLO_FLAG = "--dangerously-skip-permissions"
 LEGEND = (" %s running now (enter refused — attach to the live one) · %s unloaded "
           % (M_LIVE.strip(), M_HIDDEN.strip()))
 
@@ -120,6 +121,27 @@ def claude_cmd(yolo):
     if yolo and "--dangerously-skip-permissions" not in cmd:
         cmd.append("--dangerously-skip-permissions")
     return cmd
+
+
+def yolo_default():
+    return YOLO_FLAG in claude_cmd(False)
+
+
+def toggle_yolo():
+    """Flip the skip-permissions default in the config file. Returns a status
+    message. Refuses when RESURRECT_CLAUDE_CMD overrides the config anyway."""
+    if os.environ.get("RESURRECT_CLAUDE_CMD"):
+        return "set via RESURRECT_CLAUDE_CMD — unset the env var to use this toggle"
+    conf = load_json(CONFFILE, {})
+    cmd = shlex.split(conf.get("claude_cmd") or "claude") or ["claude"]
+    if YOLO_FLAG in cmd:
+        cmd = [c for c in cmd if c != YOLO_FLAG]
+    else:
+        cmd.append(YOLO_FLAG)
+    conf["claude_cmd"] = " ".join(cmd)
+    save_json(CONFFILE, conf)
+    return ("yolo ON — claude launches with " + YOLO_FLAG if YOLO_FLAG in cmd
+            else "yolo off — claude prompts for permissions")
 
 
 def ps_lines():
@@ -221,11 +243,23 @@ def scan(days=None, only_sids=None, min_size=MIN_SIZE):
     return rows
 
 
-COLS = "   %4s  %-12s  %-38s  %-52s  %s" % ("AGE", "LAST USED", "DIRECTORY",
-                                            "NAME", "ID")
+def col_widths(width):
+    """DIRECTORY/NAME flex with the terminal; AGE/date/ID stay fixed.
+    width=None keeps the wide default (piped output)."""
+    if not width:
+        return 38, 52
+    free = max(width - 35, 32)   # mark+age+stamp+id+separators ≈ 35 cells
+    dir_w = max(16, int(free * 0.4))
+    return dir_w, max(16, free - dir_w)
 
 
-def fmt_row(r, live, hidden):
+def cols_line(width=None):
+    dw, nw = col_widths(width)
+    return "   %4s  %-12s  %-*s  %-*s  %s" % ("AGE", "LAST USED",
+                                              dw, "DIRECTORY", nw, "NAME", "ID")
+
+
+def fmt_row(r, live, hidden, width=None):
     home = os.path.expanduser("~")
     age = time.time() - r["mtime"]
     rel = ("%dm" % (age // 60) if age < 3600 else
@@ -234,8 +268,10 @@ def fmt_row(r, live, hidden):
     stamp = datetime.datetime.fromtimestamp(r["mtime"]).strftime("%d %b %H:%M")
     mark = (M_LIVE if r["sid"] in live
             else M_HIDDEN if r["sid"] in hidden else M_NONE)
-    return "%s %4s  %-12s  %-38.38s  %-52.52s  %s" % (
-        mark, rel, stamp, r["cwd"].replace(home, "~"), r["title"], r["sid"][:8])
+    dw, nw = col_widths(width)
+    return "%s %4s  %-12s  %-*.*s  %-*.*s  %s" % (
+        mark, rel, stamp, dw, dw, r["cwd"].replace(home, "~"),
+        nw, nw, r["title"], r["sid"][:8])
 
 
 def prompt_line(stdscr, w, label):
@@ -250,7 +286,7 @@ def prompt_line(stdscr, w, label):
             pass
         stdscr.refresh()
         ch = stdscr.getch()
-        if ch == 27:
+        if ch in (27, 3):   # esc / ctrl-c
             curses.curs_set(0)
             return None
         if ch in (curses.KEY_ENTER, 10, 13):
@@ -269,12 +305,13 @@ def picker(rows, live, header, desc):
 
     def run(stdscr):
         nonlocal hidden
-        curses.curs_set(0)
+        curses.raw()   # cbreak leaves ISIG on: ctrl-c would signal and ctrl-y
+        curses.curs_set(0)   # is BSD dsusp (suspends!) — take them as plain keys
         try:
             curses.use_default_colors()
         except Exception:
             pass
-        query, pos, top, show_hidden = "", 0, 0, False
+        query, pos, top, show_hidden, flash = "", 0, 0, False, ""
         while True:
             q = query.lower()
             view = []
@@ -298,13 +335,16 @@ def picker(rows, live, header, desc):
                 if stdscr.getch() == 27:
                     return None
                 continue   # anything else (incl. resize) just re-renders
-            title = " resurrect — %s · %d session%s%s%s" % (
+            title = " resurrect — %s · %d session%s%s%s%s%s" % (
                 header, len(view), "s"[:len(view) != 1],
                 "  ·  filter: " + query if query else "",
-                "  ·  showing unloaded" if show_hidden else "")
+                "  ·  showing unloaded" if show_hidden else "",
+                "  ·  %syolo" % M_LIVE.strip() if yolo_default() else "",
+                ("  ·  " + flash) if flash else "")
+            flash = ""
             chrome = [(0, title, curses.A_BOLD | curses.A_REVERSE)]
             chrome += [(1 + i, " " + d, curses.A_DIM) for i, d in enumerate(desc)]
-            chrome += [(1 + len(desc), COLS, curses.A_BOLD),
+            chrome += [(1 + len(desc), cols_line(w), curses.A_BOLD),
                        (h - 2, KEYBAR, curses.A_REVERSE),
                        (h - 1, LEGEND, curses.A_DIM)]
             for y, txt, attr in chrome:
@@ -327,13 +367,13 @@ def picker(rows, live, header, desc):
                     curses.A_DIM if r["sid"] in hidden else curses.A_NORMAL)
                 try:
                     stdscr.addnstr(body_top + i, 0,
-                                   fmt_row(r, live, hidden).ljust(w - 1),
+                                   fmt_row(r, live, hidden, w).ljust(w - 1),
                                    w - 1, attr)
                 except (curses.error, UnicodeEncodeError):
                     pass
             stdscr.refresh()
             ch = stdscr.getch()
-            if ch == 27:
+            if ch in (27, 3):   # esc / ctrl-c
                 return None
             elif ch == curses.KEY_DOWN:
                 pos = min(pos + 1, max(len(view) - 1, 0))
@@ -346,6 +386,8 @@ def picker(rows, live, header, desc):
                     sid = rows[view[pos]]["sid"]
                     hidden ^= {sid}
                     save_json(HIDEFILE, sorted(hidden))
+            elif ch == 25:                      # ctrl-y: toggle skip-perms default
+                flash = toggle_yolo()
             elif ch == 14:                      # ctrl-n: new named session here
                 name = prompt_line(stdscr, w, "new session name: ")
                 if name is not None:
