@@ -134,6 +134,17 @@ resurrect's own files are written with `0600` permissions. Everything stays on y
 
 **Is my data safe to share this with colleagues?** The tool ships no data — each person sees only their own local transcripts.
 
+## Companion: claude-hamster
+
+[`claude-hamster`](https://github.com/davidtedmanjones/claude-hamster) is the
+other half of the story: a live board for the sessions you're *running* —
+one Claude Code session per tmux window, a VS Code sidebar showing state
+(working / needs-you / unread / snoozed) with PR, ticket, worktree and
+artifact decoration. It reads the same transcript ground truth, offers this
+tool's session catalog in its adopt picker, and shares the name store. Use
+resurrect to find and revive anything you ever ran; use hamster to live with
+the sessions you're running.
+
 ## License
 
 MIT
